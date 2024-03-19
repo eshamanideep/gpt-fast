@@ -35,7 +35,7 @@ sys.path.append(str(wd))
 from sentencepiece import SentencePieceProcessor
 
 from model import Transformer
-
+from draft_model import DraftTransformer
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -213,11 +213,15 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp):
+def _load_model(checkpoint_path, device, precision, use_tp, draft = False):
     use_cuda = 'cuda' in device
     with torch.device('meta'):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        if draft:
+            model = DraftTransformer.from_name(checkpoint_path.parent.name)
+        else:
+            model = Transformer.from_name(checkpoint_path.parent.name)
 
+    #not testing spec dec with quantisation currently 
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
         from quantize import WeightOnlyInt8QuantHandler
@@ -240,9 +244,14 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     model.load_state_dict(checkpoint, assign=True)
 
     if use_tp:
-        from tp import apply_tp
-        print("Applying tensor parallel to model ...")
-        apply_tp(model)
+        if draft:
+            from draft_tp import apply_tp 
+            print("Applying tensor parallel to draft model")
+            apply_tp(model)
+        else:
+            from tp import apply_tp
+            print("Applying tensor parallel to model ...")
+            apply_tp(model)
 
     model = model.to(device=device, dtype=precision)
     return model.eval()
@@ -290,7 +299,7 @@ def main(
     model = _load_model(checkpoint_path, device, precision, use_tp)
 
     if is_speculative:
-        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
+        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp, True)
     else:
         draft_model = None
 
