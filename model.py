@@ -195,7 +195,6 @@ class Attention(nn.Module):
         y = self.wo(y)
         return y
 
-
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
@@ -205,7 +204,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
