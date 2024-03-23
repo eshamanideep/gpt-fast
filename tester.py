@@ -1,5 +1,5 @@
 #a gradio interface for running the model and seeing the token speed
-import itertools, sys, time, argparse
+import itertools, sys, time, argparse, inspect
 from pathlib import Path 
 from typing import Optional, Tuple 
 import gradio as gr
@@ -71,15 +71,10 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
             )
             input_pos += 1
             new_tokens.append(next_token.clone())
-            callback(new_tokens[-1])
             new_probs.append(next_prob.clone())
             cur_token = next_token.view(1, -1)
 
-    return new_tokens, new_probs
-
-
-def model_forward(model, x, input_pos):
-    return model(x, input_pos)
+            yield new_tokens
 
 @torch.no_grad()
 def generate(
@@ -114,8 +109,13 @@ def generate(
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
 
-    generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-    seq[T + 1:] = torch.cat(generated_tokens)
+    generated_tokens = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+    final_tokens = []
+    for token_sets in generated_tokens:
+        final_tokens = token_sets
+        yield torch.cat(token_sets) #yield the tokens
+        
+    seq[T + 1:] = torch.cat(final_tokens)
 
     return seq
 
@@ -196,6 +196,7 @@ def bot(
     session_state,
 ): 
     #we will ignore highlight_EaInfer for now 
+    global args
     if not history:
         return history, "0.00 tokens/s", "0.00", session_state
     pure_history = session_state.get("pure_history", [])
@@ -231,37 +232,25 @@ def bot(
     done_generating = False
     buffer = ''
     period_id = tokenizer.encode('.')[0]
-    
-    def callback(x):
-        #calculate the tokens per second and yield the token 
-        nonlocal done_generating, buffer, t0
-        if done_generating:
-            return
-        
-        t1 = time.perf_counter()
-        buffer += tokenizer.decode([period_id] + x.tolist())[1:]
-        if x.item() == tokenizer.eos_id():
-            done_generating = True
-        
-        #yield the tokens per second and history 
-        history[-1][1] = buffer
-        yield history, f"{len(x.tolist()) / (t1 - t0):.2f} tokens/s", session_state
-        t0 = time.perf_counter()
 
     y = generate(
         model, 
         encoded,
         max_new_tokens = 1024,
-        callback = callback,
         temperature = temperature,
     )
+
+    for tokens in y:
+        t1 = time.perf_counter()
+        history[-1][1] = tokenizer.decode([period_id] + tokens.tolist())[1:]
+        yield history, f"{len(tokens.tolist()) / (t1 - t0):.2f} tokens/s", session_state
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
 parser.add_argument('--eagle_checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/eagle.pth"), help='Eagle checkpoint path.')
 parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
-parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
+parser.add_argument('--model_type', action = 'store_true', help = 'Chat template for the model.', default = 'llama-2-chat')
 args = parser.parse_args()
 
 assert args.checkpoint_path.is_file(), args.checkpoint_path
@@ -280,23 +269,23 @@ if use_tp:
 precision = torch.bfloat16 
 print("Loading model...", flush = True)
 
+start_time = time.time()
 model = _load_model(args.checkpoint_path, default_device, precision, use_tp)
 device_sync(device = default_device)
+endd_time = time.time()
+print(f"Loading model took {endd_time - start_time}s")
 
 tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
 
 #compile the forward pass 
 if args.compile: 
-    print("Compiling the forward pass...", flush = True)
-    model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
-    print("Forward pass compiled!")
-
+    print("Compile decode one token")
     decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
+    print("Compiling decode one token done")
 
-    if args.compile_prefill:
-        print("Compiling prefill...", flush = True)
-        prefill = torch.compile(prefill, mode="reduce-overhead", fullgraph=True)
-        print("Prefill compiled!", flush = True)
+    print("Compiling prefill...", flush = True)
+    prefill = torch.compile(prefill, mode="reduce-overhead", fullgraph=True)
+    print("Prefill compiled!", flush = True)
 
 custom_css = """
 #speed textarea {
