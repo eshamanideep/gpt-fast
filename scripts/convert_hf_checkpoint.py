@@ -17,7 +17,6 @@ sys.path.append(str(wd))
 
 from model import ModelArgs
 
-
 @torch.inference_mode()
 def convert_hf_checkpoint(
     *,

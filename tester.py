@@ -20,7 +20,8 @@ def device_sync(device):
 #compilation arguments 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
-torch._inductor.config.fx_graph_cache = True
+torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
+torch._inductor.config.triton.cudagraph_trees = False #maybe there is a bug in the cudagraph trees
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -37,7 +38,9 @@ def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling with
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    logits = logits / max(temperature, 1e-5)
+    logits = logits.to(dtype = torch.float32) / max(temperature, 1e-5)
+
+    # print("Datatype of logits: ", logits.dtype)
 
     if top_k is not None:
         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -47,7 +50,9 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     return probs
 
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
+    # print("Logits are ", logits)
     probs = logits_to_probs(logits[0, -1], temperature, top_k)
+    # print("Probs are ", probs)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
@@ -57,7 +62,7 @@ def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **samp
     return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-    # input_pos: [B, 1]
+    # input_pos: [B, 1]d
     assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
@@ -73,7 +78,6 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
             new_tokens.append(next_token.clone())
             new_probs.append(next_prob.clone())
             cur_token = next_token.view(1, -1)
-
             yield new_tokens
 
 @torch.no_grad()
@@ -156,7 +160,8 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         print("Applying tensor parallel to model ...")
         apply_tp(model)
 
-    model = model.to(device=device, dtype=precision)
+    # model = model.to(device=device, dtype = precision)
+    model = model.to(device = device)
     return model.eval()
 
 #gradio helper functions from here <---------------------->
@@ -189,12 +194,9 @@ def regenerate(history,session_state):
 
 def bot(
     history, 
-    temperature, 
-    top_p, 
-    use_EaInfer,
-    highlight_EaInfer,
     session_state,
 ): 
+    temperature, top_p, use_EaInfer, highlight_EaInfer =0.0,0.0,True,True
     #we will ignore highlight_EaInfer for now 
     global args
     if not history:
@@ -222,9 +224,12 @@ def bot(
     if args.model_type == "llama-2-chat":
         prompt += " "
 
+    print("Prompt is ", prompt)
+
     global tokenizer, model 
 
-    encoded = encode_tokens(tokenizer, prompt.strip(), bos = True, device = default_device)
+    encoded = encode_tokens(tokenizer, prompt, bos = True, device = default_device)
+    print("Encoded is ", encoded)
     prompt_length = encoded.size(0)
 
     device_sync(device = default_device)
@@ -250,7 +255,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
 parser.add_argument('--eagle_checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/eagle.pth"), help='Eagle checkpoint path.')
 parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
-parser.add_argument('--model_type', action = 'store_true', help = 'Chat template for the model.', default = 'llama-2-chat')
+parser.add_argument("--model-type", type=str, default="llama-2-chat", help="llama-2-chat or vicuna, for chat template")
 args = parser.parse_args()
 
 assert args.checkpoint_path.is_file(), args.checkpoint_path
@@ -266,7 +271,7 @@ if use_tp:
         #replace print for ranks other than 0
         print = lambda *args, **kwargs: None
 
-precision = torch.bfloat16 
+precision = torch.bfloat16
 print("Loading model...", flush = True)
 
 start_time = time.time()
@@ -287,6 +292,8 @@ if args.compile:
     prefill = torch.compile(prefill, mode="reduce-overhead", fullgraph=True)
     print("Prefill compiled!", flush = True)
 
+print("Time to warm up (compile): ", (we - ws))
+
 custom_css = """
 #speed textarea {
     color: red;   
@@ -299,12 +306,6 @@ with gr.Blocks(css=custom_css) as demo:
     gr.Markdown('''## EAGLE - gptfast Chatbot''')
     with gr.Row():
         speed_box = gr.Textbox(label="Speed", elem_id="speed", interactive=False, value="0.00 tokens/s")
-    with gr.Row():
-        with gr.Column():
-            use_EaInfer = gr.Checkbox(label="Use EAGLE", value=True)
-            highlight_EaInfer = gr.Checkbox(label="Highlight the tokens generated by EAGLE", value=True)
-        temperature = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="temperature", value=0.5)
-        top_p = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="top_p", value=0.9)
 
 
     chatbot = gr.Chatbot(height=600,show_label=False)
@@ -316,15 +317,15 @@ with gr.Blocks(css=custom_css) as demo:
         regenerate_button = gr.Button("Regenerate")
         clear_button = gr.Button("Clear")
     enter_event=msg.submit(user, [msg, chatbot,gs], [msg, chatbot,gs], queue=True).then(
-        bot, [chatbot, temperature, top_p, use_EaInfer, highlight_EaInfer,gs], [chatbot,speed_box,gs]
+        bot, [chatbot,gs], [chatbot,speed_box,gs]
     )
     clear_button.click(clear, [chatbot,gs], [chatbot,speed_box,gs], queue=True)
 
     send_event=send_button.click(user, [msg, chatbot,gs], [msg, chatbot,gs],queue=True).then(
-        bot, [chatbot, temperature, top_p, use_EaInfer, highlight_EaInfer,gs], [chatbot,speed_box,gs]
+        bot, [chatbot ,gs], [chatbot,speed_box,gs]
     )
     regenerate_event=regenerate_button.click(regenerate, [chatbot,gs], [chatbot, msg,speed_box,gs],queue=True).then(
-        bot, [chatbot, temperature, top_p, use_EaInfer, highlight_EaInfer,gs], [chatbot,speed_box,gs]
+        bot, [chatbot,gs], [chatbot,speed_box,gs]
     )
     stop_button.click(fn=None, inputs=None, outputs=None, cancels=[send_event,regenerate_event,enter_event])
 demo.queue()
