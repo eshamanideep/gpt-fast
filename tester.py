@@ -196,7 +196,7 @@ def bot(
     history, 
     session_state,
 ): 
-    temperature, top_p, use_EaInfer, highlight_EaInfer =0.0,0.0,True,True
+    temperature, top_p, use_EaInfer, highlight_EaInfer =0.7,0.0,True,True
     #we will ignore highlight_EaInfer for now 
     global args
     if not history:
@@ -229,7 +229,6 @@ def bot(
     global tokenizer, model 
 
     encoded = encode_tokens(tokenizer, prompt, bos = True, device = default_device)
-    print("Encoded is ", encoded)
     prompt_length = encoded.size(0)
 
     device_sync(device = default_device)
@@ -291,8 +290,6 @@ if args.compile:
     print("Compiling prefill...", flush = True)
     prefill = torch.compile(prefill, mode="reduce-overhead", fullgraph=True)
     print("Prefill compiled!", flush = True)
-
-print("Time to warm up (compile): ", (we - ws))
 
 custom_css = """
 #speed textarea {
